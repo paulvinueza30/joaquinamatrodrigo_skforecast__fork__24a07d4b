@@ -61,6 +61,7 @@ def _get_metric(metric: str) -> Callable:
 def add_y_train_argument(func):
     """
     Add `y_train` argument to a function if it is not already present.
+    Also creates a NaN-aware wrapper for scikit-learn metrics.
 
     Parameters
     ----------
@@ -70,7 +71,7 @@ def add_y_train_argument(func):
     Returns
     -------
     wrapper : callable
-        Function with `y_train` argument added.
+        Function with `y_train` argument added and NaN handling.
     """
     sig = inspect.signature(func)
     
@@ -84,7 +85,52 @@ def add_y_train_argument(func):
 
     @wraps(func)
     def wrapper(*args, y_train=None, **kwargs):
-        return func(*args, **kwargs)
+        # Handle NaN values in y_true and y_pred for scikit-learn metrics
+        
+        # Get y_true and y_pred from either args or kwargs
+        if len(args) >= 2:
+            y_true, y_pred = args[0], args[1]
+            remaining_args = args[2:]
+        elif len(args) == 1 and 'y_pred' in kwargs:
+            y_true = args[0]
+            y_pred = kwargs.pop('y_pred')
+            remaining_args = ()
+        elif len(args) == 0 and 'y_true' in kwargs and 'y_pred' in kwargs:
+            y_true = kwargs.pop('y_true')
+            y_pred = kwargs.pop('y_pred')
+            remaining_args = ()
+        else:
+            # Fallback for edge cases - can't identify y_true/y_pred
+            return func(*args, **kwargs)
+        
+        # Convert to numpy arrays for easier handling
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+        
+        # Create mask for valid (non-NaN) pairs
+        valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        
+        # If no valid pairs, return NaN
+        if not np.any(valid_mask):
+            return np.nan
+        
+        # Filter to only valid pairs
+        y_true_valid = y_true[valid_mask]
+        y_pred_valid = y_pred[valid_mask]
+        
+        # Also filter remaining_args if they have the same length (e.g. sample_weight)
+        filtered_remaining_args = []
+        for arg in remaining_args:
+            if hasattr(arg, '__len__') and len(arg) == len(y_true):
+                # This looks like it should be filtered along with y_true/y_pred
+                filtered_arg = np.asarray(arg)[valid_mask]
+                filtered_remaining_args.append(filtered_arg)
+            else:
+                # Keep as is
+                filtered_remaining_args.append(arg)
+        
+        # Call the original function with filtered data
+        return func(y_true_valid, y_pred_valid, *filtered_remaining_args, **kwargs)
     
     wrapper.__signature__ = new_sig
     
@@ -106,6 +152,10 @@ def mean_absolute_scaled_error(
     that each element is the true value of the target variable in the training
     set for each time series. In this case, the naive forecast is calculated
     for each time series separately.
+    
+    NaN values in y_train are ignored when calculating the naive forecast.
+    If y_true or y_pred contain NaN values, only the non-NaN pairs are used
+    for the calculation.
 
     Parameters
     ----------
@@ -141,12 +191,44 @@ def mean_absolute_scaled_error(
     if len(y_true) == 0 or len(y_pred) == 0:
         raise ValueError("y_true and y_pred must have at least one element")
 
+    # Handle NaN values in y_true and y_pred - only use valid pairs
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+    
+    if not np.any(valid_mask):
+        return np.nan
+    
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
     if isinstance(y_train, list):
-        naive_forecast = np.concatenate([np.diff(x) for x in y_train])
-        mase = np.mean(np.abs(y_true - y_pred)) / np.mean(np.abs(naive_forecast))
-
+        # Handle list of arrays/series - filter NaN values from each series
+        naive_forecast_diffs = []
+        for x in y_train:
+            x_array = np.asarray(x)
+            x_valid = x_array[~np.isnan(x_array)]
+            if len(x_valid) > 1:  # Need at least 2 values to compute diff
+                naive_forecast_diffs.append(np.diff(x_valid))
+        
+        if not naive_forecast_diffs:
+            return np.nan
+            
+        naive_forecast = np.concatenate(naive_forecast_diffs)
+        if len(naive_forecast) == 0:
+            return np.nan
+            
+        mase = np.mean(np.abs(y_true_valid - y_pred_valid)) / np.mean(np.abs(naive_forecast))
     else:
-        mase = np.mean(np.abs(y_true - y_pred)) / np.mean(np.abs(np.diff(y_train)))
+        # Handle single array/series - filter NaN values
+        y_train_array = np.asarray(y_train)
+        y_train_valid = y_train_array[~np.isnan(y_train_array)]
+        
+        if len(y_train_valid) < 2:  # Need at least 2 values to compute diff
+            return np.nan
+            
+        naive_forecast = np.diff(y_train_valid)
+        mase = np.mean(np.abs(y_true_valid - y_pred_valid)) / np.mean(np.abs(naive_forecast))
 
     return mase
 
@@ -166,6 +248,10 @@ def root_mean_squared_scaled_error(
     that each element is the true value of the target variable in the training
     set for each time series. In this case, the naive forecast is calculated
     for each time series separately.
+    
+    NaN values in y_train are ignored when calculating the naive forecast.
+    If y_true or y_pred contain NaN values, only the non-NaN pairs are used
+    for the calculation.
 
     Parameters
     ----------
@@ -202,10 +288,43 @@ def root_mean_squared_scaled_error(
     if len(y_true) == 0 or len(y_pred) == 0:
         raise ValueError("y_true and y_pred must have at least one element")
 
+    # Handle NaN values in y_true and y_pred - only use valid pairs
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+    
+    if not np.any(valid_mask):
+        return np.nan
+    
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
     if isinstance(y_train, list):
-        naive_forecast = np.concatenate([np.diff(x) for x in y_train])
-        rmsse = np.sqrt(np.mean((y_true - y_pred) ** 2)) / np.sqrt(np.mean(naive_forecast ** 2))
+        # Handle list of arrays/series - filter NaN values from each series
+        naive_forecast_diffs = []
+        for x in y_train:
+            x_array = np.asarray(x)
+            x_valid = x_array[~np.isnan(x_array)]
+            if len(x_valid) > 1:  # Need at least 2 values to compute diff
+                naive_forecast_diffs.append(np.diff(x_valid))
+        
+        if not naive_forecast_diffs:
+            return np.nan
+            
+        naive_forecast = np.concatenate(naive_forecast_diffs)
+        if len(naive_forecast) == 0:
+            return np.nan
+            
+        rmsse = np.sqrt(np.mean((y_true_valid - y_pred_valid) ** 2)) / np.sqrt(np.mean(naive_forecast ** 2))
     else:
-        rmsse = np.sqrt(np.mean((y_true - y_pred) ** 2)) / np.sqrt(np.mean(np.diff(y_train) ** 2))
+        # Handle single array/series - filter NaN values
+        y_train_array = np.asarray(y_train)
+        y_train_valid = y_train_array[~np.isnan(y_train_array)]
+        
+        if len(y_train_valid) < 2:  # Need at least 2 values to compute diff
+            return np.nan
+            
+        naive_forecast = np.diff(y_train_valid)
+        rmsse = np.sqrt(np.mean((y_true_valid - y_pred_valid) ** 2)) / np.sqrt(np.mean(naive_forecast ** 2))
     
     return rmsse
